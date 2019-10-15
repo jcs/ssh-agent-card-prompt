@@ -32,8 +32,8 @@ $(OBJS): *.c
 install: all
 	mkdir -p $(DESTDIR)$(BINDIR)
 	$(INSTALL_PROGRAM) $(PROG) $(DESTDIR)$(BINDIR)
-	#mkdir -p $(DESTDIR)$(MANDIR)
-	#$(INSTALL_DATA) -m 644 ${PROG}.1 $(DESTDIR)$(MANDIR)/${PROG}.1
+	mkdir -p $(DESTDIR)$(MANDIR)
+	$(INSTALL_DATA) -m 644 ${PROG}.1 $(DESTDIR)$(MANDIR)/${PROG}.1
 
 clean:
 	rm -f $(PROG) $(OBJS)
