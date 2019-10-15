@@ -4,7 +4,7 @@
 
 **ssh-agent-card-prompt** - intercept
 ssh-agent(1)
-requests for SSH key signing that requires tapping a physical security
+requests for SSH key signing that require tapping a physical security
 key and prompt the user
 
 # SYNOPSIS
