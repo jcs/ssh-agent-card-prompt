@@ -1,6 +1,6 @@
-SSH-AGENT-CARD-PROMPT(1) - General Commands Manual
+# ssh-agent-card-prompt
 
-# NAME
+![https://jcs.org/images/ssh-agent-card-prompt.png](https://jcs.org/images/ssh-agent-card-prompt.png)
 
 **ssh-agent-card-prompt** - intercept
 ssh-agent(1)
