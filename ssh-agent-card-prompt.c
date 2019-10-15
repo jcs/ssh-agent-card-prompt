@@ -18,12 +18,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <errno.h>
 #include <err.h>
 #include <unistd.h>
 #include <signal.h>
 #include <endian.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 #include <sys/un.h>
 
 #include <X11/Xlib.h>
@@ -31,7 +33,7 @@
 #include <X11/Xatom.h>
 #include <X11/Xft/Xft.h>
 
-#define TOUCH_PROMPT "Please tap the security key to continue with SSH signing request"
+#define TOUCH_PROMPT "Tap the security key to continue with signing request"
 
 /* https://tools.ietf.org/html/draft-miller-ssh-agent-03 */
 struct agent_msg_hdr {
@@ -43,9 +45,10 @@ struct agent_msg_hdr {
 
 uint32_t be32bytes(unsigned char *);
 void	rollback(int);
-int	forward_agent_message(ssize_t, void *, int);
+int	forward_agent_message(ssize_t, void *, int, pid_t);
 void	x11_init(void);
-int	x11_prompt(char *);
+int	x11_prompt(char *, pid_t);
+int	procname(pid_t, char **);
 
 static char *auth_sock = NULL, *upstream_auth_sock = NULL;
 static char pkcs_key[1024];
@@ -88,6 +91,7 @@ int
 main(int argc, char *argv[])
 {
 	struct sockaddr_un sunaddr;
+	struct sockpeercred peercred;
 	struct pollfd pfd[2];
 	ssize_t len;
 	socklen_t slen;
@@ -153,7 +157,7 @@ main(int argc, char *argv[])
 		err(1, "unveil");
 	if (unveil(upstream_auth_sock, "rwc") == -1)
 		err(1, "unveil");
-	if (pledge("stdio unix rpath cpath", NULL) == -1)
+	if (pledge("stdio unix rpath cpath ps", NULL) == -1)
 		err(1, "pledge");
 #endif
 
@@ -177,6 +181,12 @@ main(int argc, char *argv[])
 		if (euid != 0 && getuid() != euid) {
 			warn("socket peer uid %u != uid %u", (u_int)euid,
 			    (u_int)getuid());
+			goto close;
+		}
+
+		if (getsockopt(clientfd, SOL_SOCKET, SO_PEERCRED, &peercred,
+		    &slen) == -1) {
+			warn("getsockopt(SO_PEERCRED)");
 			goto close;
 		}
 
@@ -220,7 +230,7 @@ main(int argc, char *argv[])
 				len = read(clientfd, buf, sizeof(buf));
 				DPRINTF(("got client data (%zu)\n", len));
 				if (len && (forward_agent_message(len, &buf,
-				    upstreamfd) == -1))
+				    upstreamfd, peercred.pid) == -1))
 					goto close;
 				if (pfd[0].revents & POLLHUP)
 					goto close;
@@ -231,7 +241,7 @@ main(int argc, char *argv[])
 				len = read(upstreamfd, buf, sizeof(buf));
 				DPRINTF(("got upstream data (%zu)\n", len));
 				if (len && (forward_agent_message(len, &buf,
-				    clientfd) == -1))
+				    clientfd, peercred.pid) == -1))
 					goto close;
 				if (pfd[1].revents & POLLHUP)
 					goto close;
@@ -261,7 +271,7 @@ main(int argc, char *argv[])
 }
 
 int
-forward_agent_message(ssize_t len, void *buf, int destfd)
+forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 {
 	struct agent_msg_hdr *hdr = (struct agent_msg_hdr *)buf;
 	uint32_t nkeys, klen;
@@ -408,9 +418,8 @@ forward_agent_message(ssize_t len, void *buf, int destfd)
 
 		if (klen > 0 && klen == pkcs_key_len &&
 		    memcmp(buf, pkcs_key, pkcs_key_len) == 0) {
-			DPRINTF(("SSH_AGENTC_SIGN_REQUEST for our "
-			    "pkcs key\n"));
-			if (x11_prompt(TOUCH_PROMPT) == -1)
+			DPRINTF(("SSH_AGENTC_SIGN_REQUEST for our pkcs key\n"));
+			if (x11_prompt(TOUCH_PROMPT, clientpid) == -1)
 				return -1;
 		}
 	}
@@ -440,7 +449,7 @@ x11_init(void)
 }
 
 int
-x11_prompt(char *string)
+x11_prompt(char *prompt, pid_t clientpid)
 {
 	XSetWindowAttributes attr;
 	Window win;
@@ -448,7 +457,8 @@ x11_prompt(char *string)
 	XftDraw *draw;
 	XGlyphInfo gi;
 	struct pollfd pfd[2];
-	int grab, x, ret = -1;
+	char *clientproc, *tmp;
+	int grab, x, y, ret = -1;
 
 	attr.colormap = colormap;
 	attr.override_redirect = 1;
@@ -486,11 +496,32 @@ x11_prompt(char *string)
 
 	XMapRaised(dpy, win);
 
-	XftTextExtentsUtf8(dpy, font, (FcChar8 *)string, strlen(string), &gi);
+	/* draw prompt */
+	XftTextExtentsUtf8(dpy, font, (FcChar8 *)prompt, strlen(prompt), &gi);
+	y = (DisplayHeight(dpy, DefaultScreen(dpy)) / 2) - (gi.height * 1.2);
 	XftDrawStringUtf8(draw, &xftcolor, font,
-	    (DisplayWidth(dpy, DefaultScreen(dpy)) / 2) - (gi.width / 2),
-	    (DisplayHeight(dpy, DefaultScreen(dpy)) / 2) - (gi.height / 2),
-	    (FcChar8 *)string, strlen(string));
+	    (DisplayWidth(dpy, DefaultScreen(dpy)) / 2) - (gi.width / 2), y,
+	    (FcChar8 *)prompt, strlen(prompt));
+	y += (gi.height * 1.3);
+
+	/* then process info */
+	if (procname(clientpid, &clientproc) == -1) {
+		clientproc = strdup("(failed finding process info)");
+		if (clientproc == NULL)
+			err(1, "malloc");
+	}
+	tmp = malloc(strlen(clientproc) + 20);
+	if (tmp == NULL)
+		err(1, "malloc");
+	snprintf(tmp, strlen(clientproc) + 20, "PID %d: %s", clientpid,
+	    clientproc);
+	free(clientproc);
+
+	XftTextExtentsUtf8(dpy, font, (FcChar8 *)tmp, strlen(tmp), &gi);
+	XftDrawStringUtf8(draw, &xftcolor, font,
+	    (DisplayWidth(dpy, DefaultScreen(dpy)) / 2) - (gi.width / 2), y,
+	    (FcChar8 *)tmp, strlen(tmp));
+	free(tmp);
 
 	XSelectInput(dpy, win, StructureNotifyMask);
 	XSync(dpy, False);
@@ -541,4 +572,69 @@ done_x:
 	XSync(dpy, False);
 
 	return ret;
+}
+
+int
+procname(pid_t pid, char **outbuf)
+{
+#ifdef __OpenBSD__
+	char *buf = NULL, **args;
+	size_t buflen = 128;
+	int mib[6] = { CTL_KERN, KERN_PROC_ARGS, 0, KERN_PROC_ARGV, 0, 0 };
+
+	buf = malloc(buflen);
+	if (buf == NULL)
+		err(1, "malloc");
+
+	/* fetch process args */
+	mib[0] = CTL_KERN;
+	mib[1] = KERN_PROC_ARGS;
+	mib[2] = pid;
+	mib[3] = KERN_PROC_ARGV;
+
+	/* keep increasing buf size until it fits */
+	while (sysctl(mib, 4, buf, &buflen, NULL, 0) == -1) {
+		if (errno != ENOMEM) {
+			free(buf);
+			return -1;
+		}
+
+		if ((buf = realloc(buf, buflen + 128)) == NULL)
+			err(1, "realloc");
+		buflen += 128;
+	}
+
+	args = (char **)buf;
+	if (args[0] == NULL) {
+		free(buf);
+		return -1;
+	}
+
+	*outbuf = malloc(1);
+	if (*outbuf == NULL)
+		err(1, "malloc");
+
+	*outbuf[0] = '\0';
+	buflen = 1;
+	while (*args != NULL) {
+		if (*outbuf[0] != '\0')
+			buflen += 1;
+		buflen += strlen(*args) + 1;
+		*outbuf = realloc(*outbuf, buflen);
+		if (*outbuf == NULL)
+			err(1, "realloc");
+		if (*outbuf[0] != '\0')
+			strlcat(*outbuf, " ", buflen);
+		strlcat(*outbuf, *args, buflen);
+		args++;
+	}
+
+	DPRINTF(("pid[%d]: %s\n", pid, *outbuf));
+
+	free(buf);
+	return 0;
+#else
+	warn("procname not implemented");
+	return -1;
+#endif
 }
