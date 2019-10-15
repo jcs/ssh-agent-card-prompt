@@ -29,6 +29,9 @@ $(PROG): $(OBJS)
 $(OBJS): *.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+README.md: $(PROG).1
+	mandoc -T markdown $(PROG).1 > README.md
+
 install: all
 	mkdir -p $(DESTDIR)$(BINDIR)
 	$(INSTALL_PROGRAM) $(PROG) $(DESTDIR)$(BINDIR)
