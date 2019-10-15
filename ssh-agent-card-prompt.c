@@ -33,7 +33,9 @@
 #include <X11/Xatom.h>
 #include <X11/Xft/Xft.h>
 
-#define TOUCH_PROMPT "Tap the security key to continue with signing request"
+#define FONT		"monospace:size=24"
+#define FONT_SMALL	"monospace:size=18"
+#define DEFAULT_PROMPT	"Tap the security key to continue with signing request"
 
 /* https://tools.ietf.org/html/draft-miller-ssh-agent-03 */
 struct agent_msg_hdr {
@@ -47,7 +49,7 @@ uint32_t be32bytes(unsigned char *);
 void	rollback(int);
 int	forward_agent_message(ssize_t, void *, int, pid_t);
 void	x11_init(void);
-int	x11_prompt(char *, pid_t);
+int	x11_prompt(pid_t);
 int	procname(pid_t, char **);
 
 static char *auth_sock = NULL, *upstream_auth_sock = NULL;
@@ -56,10 +58,11 @@ static unsigned int pkcs_key_len = 0;
 static Display *dpy = NULL;
 static XVisualInfo vinfo;
 static Colormap colormap;
-static XftFont *font;
-static XftColor xftcolor;
+static XftFont *font, *smallfont;
+static XftColor white, gray;
 static int upstreamfd = -1;
 static int debug = 0;
+static char *prompt;
 
 #define DPRINTF(x) { if (debug) { printf x; } };
 
@@ -100,10 +103,18 @@ main(int argc, char *argv[])
 	gid_t egid;
 	int ch, sock, clientfd = -1;
 
-	while ((ch = getopt(argc, argv, "d")) != -1) {
+	prompt = strdup(DEFAULT_PROMPT);
+
+	while ((ch = getopt(argc, argv, "dp:")) != -1) {
 		switch (ch) {
 		case 'd':
 			debug++;
+			break;
+		case 'p':
+			free(prompt);
+			prompt = strdup(optarg);
+			if (prompt == NULL)
+				err(1, "strdup");
 			break;
 		default:
 			exit(1);
@@ -419,7 +430,7 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 		if (klen > 0 && klen == pkcs_key_len &&
 		    memcmp(buf, pkcs_key, pkcs_key_len) == 0) {
 			DPRINTF(("SSH_AGENTC_SIGN_REQUEST for our pkcs key\n"));
-			if (x11_prompt(TOUCH_PROMPT, clientpid) == -1)
+			if (x11_prompt(clientpid) == -1)
 				return -1;
 		}
 	}
@@ -440,16 +451,22 @@ x11_init(void)
 	colormap = XCreateColormap(dpy, DefaultRootWindow(dpy), vinfo.visual,
 	    AllocNone);
 
-	font = XftFontOpenName(dpy, DefaultScreen(dpy), "monospace:size=30");
+	font = XftFontOpenName(dpy, DefaultScreen(dpy), FONT);
 	if (font == NULL)
 		errx(1, "failed opening font");
 
-	if (!XftColorAllocName(dpy, vinfo.visual, colormap, "white", &xftcolor))
-		errx(1, "failed allocating xft color");
+	smallfont = XftFontOpenName(dpy, DefaultScreen(dpy), FONT_SMALL);
+	if (smallfont == NULL)
+		errx(1, "failed opening small font");
+
+	if (!XftColorAllocName(dpy, vinfo.visual, colormap, "white", &white))
+		errx(1, "failed allocating white");
+	if (!XftColorAllocName(dpy, vinfo.visual, colormap, "#eeeeee", &gray))
+		errx(1, "failed allocating gray");
 }
 
 int
-x11_prompt(char *prompt, pid_t clientpid)
+x11_prompt(pid_t clientpid)
 {
 	XSetWindowAttributes attr;
 	Window win;
@@ -457,13 +474,14 @@ x11_prompt(char *prompt, pid_t clientpid)
 	XftDraw *draw;
 	XGlyphInfo gi;
 	struct pollfd pfd[2];
-	char *clientproc, *tmp;
+	size_t len;
+	char *clientproc, *word, *line;
 	int grab, x, y, ret = -1;
 
 	attr.colormap = colormap;
 	attr.override_redirect = 1;
 	attr.border_pixel = 0;
-	attr.background_pixel = 0x01010101;
+	attr.background_pixel = 0x28000000; /* 40% opacity */
 
 	win = XCreateWindow(dpy, DefaultRootWindow(dpy), 0, 0,
 	    DisplayWidth(dpy, DefaultScreen(dpy)),
@@ -499,29 +517,70 @@ x11_prompt(char *prompt, pid_t clientpid)
 	/* draw prompt */
 	XftTextExtentsUtf8(dpy, font, (FcChar8 *)prompt, strlen(prompt), &gi);
 	y = (DisplayHeight(dpy, DefaultScreen(dpy)) / 2) - (gi.height * 1.2);
-	XftDrawStringUtf8(draw, &xftcolor, font,
+	XftDrawStringUtf8(draw, &white, font,
 	    (DisplayWidth(dpy, DefaultScreen(dpy)) / 2) - (gi.width / 2), y,
 	    (FcChar8 *)prompt, strlen(prompt));
 	y += (gi.height * 1.3);
 
-	/* then process info */
+	/* then add process info */
 	if (procname(clientpid, &clientproc) == -1) {
 		clientproc = strdup("(failed finding process info)");
 		if (clientproc == NULL)
 			err(1, "malloc");
 	}
-	tmp = malloc(strlen(clientproc) + 20);
-	if (tmp == NULL)
+	line = malloc(strlen(clientproc) + 20);
+	if (line == NULL)
 		err(1, "malloc");
-	snprintf(tmp, strlen(clientproc) + 20, "PID %d: %s", clientpid,
+	snprintf(line, strlen(clientproc) + 20, "PID %d: %s", clientpid,
 	    clientproc);
-	free(clientproc);
+	clientproc = line;
 
-	XftTextExtentsUtf8(dpy, font, (FcChar8 *)tmp, strlen(tmp), &gi);
-	XftDrawStringUtf8(draw, &xftcolor, font,
-	    (DisplayWidth(dpy, DefaultScreen(dpy)) / 2) - (gi.width / 2), y,
-	    (FcChar8 *)tmp, strlen(tmp));
-	free(tmp);
+	/* process info may be long, so wrap it to multiple lines */
+	line = strdup("");
+	if (line == NULL)
+		err(1, "strdup");
+	for ((word = strsep(&clientproc, " ")); word && *word != '\0';
+	    (word = strsep(&clientproc, " "))) {
+		char *oldline = strdup(line);
+		if (oldline == NULL)
+			err(1, "strdup");
+
+	    	len = strlen(line) + 1 + strlen(word) + 1;
+		line = realloc(line, len);
+
+		if (line[0] != '\0')
+			strlcat(line, " ", len);
+
+		strlcat(line, word, len);
+
+		XftTextExtentsUtf8(dpy, smallfont, (FcChar8 *)line,
+		    strlen(line), &gi);
+		if (gi.width > (DisplayWidth(dpy, DefaultScreen(dpy)) * 0.9)) {
+			/* this line is now too long, draw the old one */
+			XftTextExtentsUtf8(dpy, smallfont, (FcChar8 *)oldline,
+			    strlen(oldline), &gi);
+			XftDrawStringUtf8(draw, &gray, smallfont,
+			    (DisplayWidth(dpy, DefaultScreen(dpy)) / 2) -
+			    (gi.width / 2), y, (FcChar8 *)oldline,
+			    strlen(oldline));
+			y += (gi.height * 1.2);
+
+			free(line);
+			line = strdup(word);
+			if (line == NULL)
+				err(1, "strdup");
+		}
+	}
+
+	if (line != NULL && line[0] != '\0') {
+		XftTextExtentsUtf8(dpy, smallfont, (FcChar8 *)line,
+		    strlen(line), &gi);
+		XftDrawStringUtf8(draw, &gray, smallfont,
+		    (DisplayWidth(dpy, DefaultScreen(dpy)) / 2) -
+		    (gi.width / 2), y, (FcChar8 *)line, strlen(line));
+		free(line);
+	}
+	free(clientproc);
 
 	XSelectInput(dpy, win, StructureNotifyMask);
 	XSync(dpy, False);
@@ -629,7 +688,7 @@ procname(pid_t pid, char **outbuf)
 		args++;
 	}
 
-	DPRINTF(("pid[%d]: %s\n", pid, *outbuf));
+	DPRINTF(("PID %d: %s\n", pid, *outbuf));
 
 	free(buf);
 	return 0;
