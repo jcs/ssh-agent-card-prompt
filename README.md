@@ -2,10 +2,10 @@
 
 ![https://jcs.org/images/ssh-agent-card-prompt.png](https://jcs.org/images/ssh-agent-card-prompt.png)
 
-**ssh-agent-card-prompt** - intercept
+**ssh-agent-card-prompt** -
+prompt the user when SSH key signing requests to an
 ssh-agent(1)
-requests for SSH key signing that require tapping a physical security
-key and prompt the user
+require tapping a physical security key (such as a YubiKey)
 
 # SYNOPSIS
 
@@ -19,32 +19,45 @@ On startup,
 **ssh-agent-card-prompt**
 moves the current
 ssh-agent(1)
-socket
-(as set in the SSH\_AUTH\_SOCK environment variable)
-to a temporary location and listens itself on that socket.
+socket (as set in the
+`SSH_AUTH_SOCK`
+environment variable) to a temporary location and creates a new socket at the
+location pointed to by that variable.
 
 When an SSH client connects,
 **ssh-agent-card-prompt**
-connects to the original ssh-agent process and proxies requests and responses
-between the two.
+connects to the original
+ssh-agent(1)
+process and proxies requests and responses between the two.
 
-When
+After
 **ssh-agent-card-prompt**
-detects an SSH\_AGENTC\_SIGN\_REQUEST message that appears to be for a PKCS key,
-it presents a modal X11 window with the
+detects and forwards an SSH\_AGENTC\_SIGN\_REQUEST message that appears to be for
+a PKCS key,
+ssh-agent(1)
+will block while waiting for the security key to be tapped and respond to the
+request.
+At that point,
+**ssh-agent-card-prompt**
+will present a modal X11 window with the
 *prompt*
-text and information about the process that is making the SSH agent connection.
+text and information about the process that is making the agent connection,
+reminding the user to tap the key.
 
 If the Escape key is pressed while presenting the dialog, the connections to
-the client and ssh-agent are dropped.
-If the security key is tapped, the original ssh-agent will send a response
-and
+the client and ssh-agent are immediately dropped.
+If the security key is tapped,
+ssh-agent(1)
+will send its response to
 **ssh-agent-card-prompt**
-will automatically close its X11 window.
+which will then automatically close its X11 window.
 
 When
 **ssh-agent-card-prompt**
-exits, the original ssh-agent socket is moved back into place.
+exits, the original ssh-agent socket is moved back to the path pointed to by
+the
+`SSH_AUTH_SOCK`
+variable.
 
 # OPTIONS
 
@@ -58,6 +71,10 @@ exits, the original ssh-agent socket is moved back into place.
 
 > The text presented to the user in the modal dialog.
 > Defaults to "Tap the security key to continue with signing request".
+
+# SEE ALSO
+
+ssh-agent(1)
 
 # AUTHORS
 

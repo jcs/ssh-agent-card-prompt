@@ -3,10 +3,10 @@
 .Os
 .Sh NAME
 .Nm ssh-agent-card-prompt
-.Nd intercept
+.Nd
+prompt the user when SSH key signing requests to an
 .Xr ssh-agent 1
-requests for SSH key signing that require tapping a physical security
-key and prompt the user
+require tapping a physical security key (such as a YubiKey)
 .Sh SYNOPSIS
 .Nm
 .Op Fl d
@@ -16,32 +16,45 @@ On startup,
 .Nm
 moves the current
 .Xr ssh-agent 1
-socket
-(as set in the SSH_AUTH_SOCK environment variable)
-to a temporary location and listens itself on that socket.
+socket (as set in the
+.Ev SSH_AUTH_SOCK
+environment variable) to a temporary location and creates a new socket at the
+location pointed to by that variable.
 .Pp
 When an SSH client connects,
 .Nm
-connects to the original ssh-agent process and proxies requests and responses
-between the two.
+connects to the original
+.Xr ssh-agent 1
+process and proxies requests and responses between the two.
 .Pp
-When
+After
 .Nm
-detects an SSH_AGENTC_SIGN_REQUEST message that appears to be for a PKCS key,
-it presents a modal X11 window with the
+detects and forwards an SSH_AGENTC_SIGN_REQUEST message that appears to be for
+a PKCS key,
+.Xr ssh-agent 1
+will block while waiting for the security key to be tapped and respond to the
+request.
+At that point,
+.Nm
+will present a modal X11 window with the
 .Ar prompt
-text and information about the process that is making the SSH agent connection.
+text and information about the process that is making the agent connection,
+reminding the user to tap the key.
 .Pp
 If the Escape key is pressed while presenting the dialog, the connections to
-the client and ssh-agent are dropped.
-If the security key is tapped, the original ssh-agent will send a response
-and
+the client and ssh-agent are immediately dropped.
+If the security key is tapped,
+.Xr ssh-agent 1
+will send its response to
 .Nm
-will automatically close its X11 window.
+which will then automatically close its X11 window.
 .Pp
 When
 .Nm
-exits, the original ssh-agent socket is moved back into place.
+exits, the original ssh-agent socket is moved back to the path pointed to by
+the
+.Ev SSH_AUTH_SOCK
+variable.
 .Sh OPTIONS
 .Bl -tag -width Ds
 .It Fl d
@@ -51,6 +64,8 @@ terminal.
 .It Fl p Ar prompt
 The text presented to the user in the modal dialog.
 Defaults to "Tap the security key to continue with signing request".
+.Sh SEE ALSO
+.Xr ssh-agent 1
 .Sh AUTHORS
 .Nm
 was written by
