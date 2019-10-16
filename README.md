@@ -59,6 +59,17 @@ the
 `SSH_AUTH_SOCK`
 variable.
 
+# CONFIGURATION
+
+Your security key should be configured to require touch confirmation for this
+to be of any use.
+
+For YubiKey keys, this can be done with
+yubico-piv-tool(1)
+by supplying
+**--touch-policy=always**
+when creating/importing keys.
+
 # OPTIONS
 
 **-d**

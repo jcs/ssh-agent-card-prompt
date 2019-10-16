@@ -55,6 +55,15 @@ exits, the original ssh-agent socket is moved back to the path pointed to by
 the
 .Ev SSH_AUTH_SOCK
 variable.
+.Sh CONFIGURATION
+Your security key should be configured to require touch confirmation for this
+to be of any use.
+.Pp
+For YubiKey keys, this can be done with
+.Xr yubico-piv-tool 1
+by supplying
+.Cm --touch-policy=always
+when creating/importing keys.
 .Sh OPTIONS
 .Bl -tag -width Ds
 .It Fl d
