@@ -101,6 +101,7 @@ main(int argc, char *argv[])
 	unsigned char buf[4096];
 	uid_t euid;
 	gid_t egid;
+	pid_t pid;
 	int ch, sock, clientfd = -1;
 
 	prompt = strdup(DEFAULT_PROMPT);
@@ -129,9 +130,6 @@ main(int argc, char *argv[])
 	len = strlen(auth_sock) + 6;
 	if ((upstream_auth_sock = malloc(len)) == NULL)
 		err(1, "malloc");
-
-	/* do this early so we can pledge */
-	x11_init();
 
 	/* move aside and let the man go through */
 	snprintf(upstream_auth_sock, len, "%s.orig", auth_sock);
@@ -164,14 +162,11 @@ main(int argc, char *argv[])
 	}
 
 #ifdef __OpenBSD__
-	if (unveil(auth_sock, "rwc") == -1)
-		err(1, "unveil");
-	if (unveil(upstream_auth_sock, "rwc") == -1)
-		err(1, "unveil");
-	if (pledge("stdio unix rpath cpath ps", NULL) == -1)
+	if (pledge("stdio unix rpath cpath ps proc", NULL) == -1)
 		err(1, "pledge");
 #endif
 
+	signal(SIGCHLD, SIG_IGN);
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGINT, rollback);
 	signal(SIGTERM, rollback);
@@ -184,25 +179,37 @@ main(int argc, char *argv[])
 			continue;
 		}
 
+		pid = fork();
+		if (pid == -1)
+			err(1, "fork");
+		else if (pid != 0) {
+			/* parent */
+			close(clientfd);
+			continue;
+		}
+
 		if (getpeereid(clientfd, &euid, &egid) == -1) {
-			warn("getpeereid");
+			warn("[%d] getpeereid", getpid());
 			goto close;
 		}
 
 		if (euid != 0 && getuid() != euid) {
-			warn("socket peer uid %u != uid %u", (u_int)euid,
-			    (u_int)getuid());
+			warn("[%d] socket peer uid %u != uid %u", getpid(),
+			    (u_int)euid, (u_int)getuid());
 			goto close;
 		}
 
 		if (getsockopt(clientfd, SOL_SOCKET, SO_PEERCRED, &peercred,
 		    &slen) == -1) {
-			warn("getsockopt(SO_PEERCRED)");
+			warn("[%d] getsockopt(SO_PEERCRED)", getpid());
 			goto close;
 		}
 
+		DPRINTF(("[%d] got client connection from pid %d\n", getpid(),
+		    peercred.pid));
+
 		if ((upstreamfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
-			warn("socket");
+			warn("[%d] socket", getpid());
 			goto close;
 		}
 
@@ -210,19 +217,25 @@ main(int argc, char *argv[])
 		sunaddr.sun_family = AF_UNIX;
 		if (strlcpy(sunaddr.sun_path, upstream_auth_sock,
 		    sizeof(sunaddr.sun_path)) >= sizeof(sunaddr.sun_path)) {
-			warn("strlcpy");
+			warn("[%d] strlcpy", getpid());
 			goto close;
 		}
 
 		if (connect(upstreamfd, (struct sockaddr *)&sunaddr,
 		    sizeof(sunaddr)) == -1) {
-			warn("connect to upstream");
+			warn("[%d] connect to upstream", getpid());
 			goto close;
 		}
 
-		pkcs_key_len = 0;
+		DPRINTF(("[%d] got upstream connection\n", getpid()));
 
-		DPRINTF(("got client connection and upstream connection\n"));
+		/* do this early so we can pledge */
+		x11_init();
+
+		if (pledge("stdio ps", NULL) == -1)
+			err(1, "[%d] pledge", getpid());
+
+		pkcs_key_len = 0;
 
 		memset(&pfd, 0, sizeof(pfd));
 		pfd[0].fd = clientfd;
@@ -232,14 +245,15 @@ main(int argc, char *argv[])
 
 		for (;;) {
 			if (poll(pfd, 2, INFTIM) == -1) {
-				warn("poll failed");
+				warn("[%d] poll failed", getpid());
 				goto close;
 			}
 
 			if ((pfd[0].revents & (POLLIN|POLLHUP))) {
 				/* client -> upstream */
 				len = read(clientfd, buf, sizeof(buf));
-				DPRINTF(("got client data (%zu)\n", len));
+				DPRINTF(("[%d] got client data (%zu)\n",
+				    getpid(), len));
 				if (len && (forward_agent_message(len, &buf,
 				    upstreamfd, peercred.pid) == -1))
 					goto close;
@@ -250,7 +264,8 @@ main(int argc, char *argv[])
 			if ((pfd[1].revents & (POLLIN|POLLHUP))) {
 				/* upstream -> client */
 				len = read(upstreamfd, buf, sizeof(buf));
-				DPRINTF(("got upstream data (%zu)\n", len));
+				DPRINTF(("[%d] got upstream data (%zu)\n",
+				    getpid(), len));
 				if (len && (forward_agent_message(len, &buf,
 				    clientfd, peercred.pid) == -1))
 					goto close;
@@ -263,6 +278,9 @@ main(int argc, char *argv[])
 		explicit_bzero(&buf, sizeof(buf));
 		explicit_bzero(&pkcs_key, sizeof(pkcs_key));
 
+		DPRINTF(("[%d] closing client and upstream connections\n",
+		    getpid()));
+
 		if (clientfd != -1) {
 			close(clientfd);
 			clientfd = -1;
@@ -271,13 +289,14 @@ main(int argc, char *argv[])
 			close(upstreamfd);
 			upstreamfd = -1;
 		}
+
+		if (dpy)
+			XCloseDisplay(dpy);
+
+		exit(0);
 	}
 
-	if (dpy)
-		XCloseDisplay(dpy);
-
-	rollback(0);
-
+	/* unreached */
 	return 0;
 }
 
@@ -290,26 +309,26 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 	int x;
 
 	if (debug >= 2) {
-		DPRINTF(("forwarding data[%zu]:", len));
+		DPRINTF(("[%d] forwarding data[%zu]:", getpid(), len));
 		for (x = 0; x < len; x++)
 			DPRINTF((" %02x", ((unsigned char *)buf)[x]));
 		DPRINTF(("\n"));
 	}
 
 	if (len < sizeof(struct agent_msg_hdr)) {
-		warnx("short message (%zu < %zu)", len,
+		warnx("[%d] short message (%zu < %zu)", getpid(), len,
 		    sizeof(struct agent_msg_hdr));
 		return -1;
 	}
 
 	if (len != (be32toh(hdr->len) + sizeof(uint32_t))) {
-		warn("message invalid len (%zu != %d + %zu)", len,
-		    be32toh(hdr->len), sizeof(uint32_t));
+		warn("[%d] message invalid len (%zu != %d + %zu)", getpid(),
+		    len, be32toh(hdr->len), sizeof(uint32_t));
 		return -1;
 	}
 
 	if (write(destfd, buf, len) != len) {
-		warn("write to destfd failed");
+		warn("[%d] write to destfd failed", getpid());
 		return -1;
 	}
 
@@ -332,8 +351,8 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 	switch (hdr->type) {
 	case SSH_AGENT_IDENTITIES_ANSWER:
 		if (len < sizeof(uint32_t)) {
-			DPRINTF(("SSH_AGENT_IDENTITIES_ANSWER but remaining "
-			    "len too short\n"));
+			DPRINTF(("[%d] SSH_AGENT_IDENTITIES_ANSWER but "
+			    "remaining len too short\n", getpid()));
 			break;
 		}
 
@@ -343,8 +362,8 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 		if (nkeys <= 0)
 			break;
 
-		DPRINTF(("SSH_AGENT_IDENTITIES_ANSWER with %d key(s)\n",
-		    nkeys));
+		DPRINTF(("[%d] SSH_AGENT_IDENTITIES_ANSWER with %d key(s)\n",
+		    getpid(), nkeys));
 
 		for (x = 0; x < nkeys && len > 0; x++) {
 			uint32_t kbloblen, kcommlen;
@@ -352,7 +371,8 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 
 			/* key blob len */
 			if (len < sizeof(uint32_t)) {
-				warn("SSH_AGENT_IDENTITIES_ANSWER short (1)");
+				warn("[%d] SSH_AGENT_IDENTITIES_ANSWER short "
+				    "(1)", getpid());
 				break;
 			}
 			kbloblen = be32bytes(buf);
@@ -360,7 +380,8 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 			buf += sizeof(uint32_t);
 
 			if (kbloblen > len) {
-				warn("SSH_AGENT_IDENTITIES_ANSWER short (2)");
+				warn("[%d] SSH_AGENT_IDENTITIES_ANSWER short "
+				    "(2)", getpid());
 				break;
 			}
 			if (kbloblen <= 0)
@@ -373,7 +394,8 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 
 			/* key comment len */
 			if (len < sizeof(uint32_t)) {
-				warn("SSH_AGENT_IDENTITIES_ANSWER short (3)");
+				warn("[%d] SSH_AGENT_IDENTITIES_ANSWER short "
+				    "(3)", getpid());
 				break;
 			}
 			kcommlen = be32bytes(buf);
@@ -381,7 +403,8 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 			buf += sizeof(uint32_t);
 
 			if (kcommlen > len) {
-				warn("SSH_AGENT_IDENTITIES_ANSWER short (4)");
+				warn("[%d] SSH_AGENT_IDENTITIES_ANSWER short "
+				    "(4)", getpid());
 				break;
 			}
 			if (kcommlen <= 0)
@@ -390,15 +413,16 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 			/* key comment */
 			kcomm = malloc(kcommlen + 2);
 			if (kcomm == NULL) {
-				warn("malloc %d", kcommlen + 2);
+				warn("[%d] malloc %d", getpid(), kcommlen + 2);
 				break;
 			}
 			strlcpy(kcomm, buf, kcommlen + 1);
-			DPRINTF(("key[%d] = %s\n", x, kcomm));
+			DPRINTF(("[%d] key[%d] = %s\n", getpid(), x, kcomm));
 
 			/* match on pkcs11 or pkcs15 */
 			if (strstr(kcomm, "pkcs1")) {
-				DPRINTF(("found pkcs1 key at %d\n", x));
+				DPRINTF(("[%d] found pkcs1 key at %d\n",
+				    getpid(), x));
 				pkcs_key_len = kbloblen;
 				memcpy(pkcs_key, kblob, kbloblen);
 			}
@@ -412,8 +436,8 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 	case SSH_AGENTC_SIGN_REQUEST:
 		/* key blob len */
 		if (len < sizeof(uint32_t)) {
-			DPRINTF(("SSH_AGENTC_SIGN_REQUEST but remaining "
-			    "len too short\n"));
+			DPRINTF(("[%d] SSH_AGENTC_SIGN_REQUEST but remaining "
+			    "len too short\n", getpid()));
 			break;
 		}
 		klen = be32bytes(buf);
@@ -421,7 +445,8 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 		buf += sizeof(uint32_t);
 
 		if (klen > len) {
-			warn("SSH_AGENTC_SIGN_REQUEST short (1)");
+			warn("[%d] SSH_AGENTC_SIGN_REQUEST short (1)",
+			    getpid());
 			break;
 		}
 		if (klen <= 0)
@@ -429,7 +454,8 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 
 		if (klen > 0 && klen == pkcs_key_len &&
 		    memcmp(buf, pkcs_key, pkcs_key_len) == 0) {
-			DPRINTF(("SSH_AGENTC_SIGN_REQUEST for our pkcs key\n"));
+			DPRINTF(("[%d] SSH_AGENTC_SIGN_REQUEST for our pkcs "
+			    "key\n", getpid()));
 			if (x11_prompt(clientpid) == -1)
 				return -1;
 		}
@@ -443,26 +469,26 @@ x11_init(void)
 {
 	dpy = XOpenDisplay(NULL);
 	if (!dpy)
-		errx(1, "XOpenDisplay failed");
+		errx(1, "[%d] XOpenDisplay failed", getpid());
 
 	if (!XMatchVisualInfo(dpy, DefaultScreen(dpy), 32, TrueColor, &vinfo))
-		errx(1, "!XMatchVisualInfo failed");
+		errx(1, "[%d] !XMatchVisualInfo failed", getpid());
 
 	colormap = XCreateColormap(dpy, DefaultRootWindow(dpy), vinfo.visual,
 	    AllocNone);
 
 	font = XftFontOpenName(dpy, DefaultScreen(dpy), FONT);
 	if (font == NULL)
-		errx(1, "failed opening font");
+		errx(1, "[%d] failed opening font", getpid());
 
 	smallfont = XftFontOpenName(dpy, DefaultScreen(dpy), FONT_SMALL);
 	if (smallfont == NULL)
-		errx(1, "failed opening small font");
+		errx(1, "[%d] failed opening small font", getpid());
 
 	if (!XftColorAllocName(dpy, vinfo.visual, colormap, "white", &white))
-		errx(1, "failed allocating white");
+		errx(1, "[%d] failed allocating white", getpid());
 	if (!XftColorAllocName(dpy, vinfo.visual, colormap, "#eeeeee", &gray))
-		errx(1, "failed allocating gray");
+		errx(1, "[%d] failed allocating gray", getpid());
 }
 
 int
@@ -491,23 +517,23 @@ x11_prompt(pid_t clientpid)
 
 	draw = XftDrawCreate(dpy, win, vinfo.visual, colormap);
 	if (!draw) {
-		warnx("can't draw with font");
+		warnx("[%d] can't draw with font", getpid());
 		ret = -1;
 		goto done_x;
 	}
 
-	/* and now if we can't grab the keyboard, pinentry probably has it */
+	/* if we can't grab the keyboard, maybe another child has it */
 	for (x = 0; x < 30; x++) {
 		grab = XGrabKeyboard(dpy, DefaultRootWindow(dpy), True,
 		    GrabModeAsync, GrabModeAsync, CurrentTime);
 		if (grab == GrabSuccess)
 			break;
 
-		warn("couldn't grab keyboard");
+		warn("[%d] couldn't grab keyboard", getpid());
 		sleep(1);
 	}
 	if (grab != GrabSuccess) {
-		warn("couldn't grab keyboard, giving up");
+		warn("[%d] couldn't grab keyboard, giving up", getpid());
 		ret = -1;
 		goto done_x;
 	}
@@ -526,11 +552,11 @@ x11_prompt(pid_t clientpid)
 	if (procname(clientpid, &clientproc) == -1) {
 		clientproc = strdup("(failed finding process info)");
 		if (clientproc == NULL)
-			err(1, "malloc");
+			err(1, "[%d] malloc", getpid());
 	}
 	line = malloc(strlen(clientproc) + 20);
 	if (line == NULL)
-		err(1, "malloc");
+		err(1, "[%d] malloc", getpid());
 	snprintf(line, strlen(clientproc) + 20, "PID %d: %s", clientpid,
 	    clientproc);
 	clientproc = line;
@@ -538,12 +564,12 @@ x11_prompt(pid_t clientpid)
 	/* process info may be long, so wrap it to multiple lines */
 	line = strdup("");
 	if (line == NULL)
-		err(1, "strdup");
+		err(1, "[%d] strdup", getpid());
 	for ((word = strsep(&clientproc, " ")); word && *word != '\0';
 	    (word = strsep(&clientproc, " "))) {
 		char *oldline = strdup(line);
 		if (oldline == NULL)
-			err(1, "strdup");
+			err(1, "[%d] strdup", getpid());
 
 	    	len = strlen(line) + 1 + strlen(word) + 1;
 		line = realloc(line, len);
@@ -597,17 +623,20 @@ x11_prompt(pid_t clientpid)
 
 		if ((pfd[0].revents & (POLLIN|POLLHUP))) {
 			XNextEvent(dpy, &ev);
-			DPRINTF(("got X11 event of type %d\n", ev.type));
+			DPRINTF(("[%d] got X11 event of type %d\n", ev.type,
+			    getpid()));
 			if (ev.type == KeyPress) {
 				if (XLookupKeysym(&ev.xkey, 0) == XK_Escape) {
-					DPRINTF(("escape pressed\n"));
+					DPRINTF(("[%d] escape pressed\n",
+					    getpid()));
 					ret = -1;
 					break;
 				} else {
 					DPRINTF(("key pressed, not escape\n"));
 				}
 			} else {
-				DPRINTF(("got other X11 event, re-raising\n"));
+				DPRINTF(("[%d] got other X11 event, "
+				    "re-raising\n", getpid()));
 				XRaiseWindow(dpy, win);
 			}
 		}
@@ -617,8 +646,8 @@ x11_prompt(pid_t clientpid)
 			 * gpg-agent is sending back data from
 			 * SSH_AGENTC_SIGN_REQUEST, the key was touched
 			 */
-			DPRINTF(("got data from upstream, key must have been "
-			    "touched\n"));
+			DPRINTF(("[%d] got data from upstream, key must have "
+			    "been touched\n", getpid()));
 			ret = 0;
 			break;
 		}
@@ -643,7 +672,7 @@ procname(pid_t pid, char **outbuf)
 
 	buf = malloc(buflen);
 	if (buf == NULL)
-		err(1, "malloc");
+		err(1, "[%d] malloc", getpid());
 
 	/* fetch process args */
 	mib[0] = CTL_KERN;
@@ -659,7 +688,7 @@ procname(pid_t pid, char **outbuf)
 		}
 
 		if ((buf = realloc(buf, buflen + 128)) == NULL)
-			err(1, "realloc");
+			err(1, "[%d] realloc", getpid());
 		buflen += 128;
 	}
 
@@ -671,7 +700,7 @@ procname(pid_t pid, char **outbuf)
 
 	*outbuf = malloc(1);
 	if (*outbuf == NULL)
-		err(1, "malloc");
+		err(1, "[%d] malloc", getpid());
 
 	*outbuf[0] = '\0';
 	buflen = 1;
@@ -681,19 +710,19 @@ procname(pid_t pid, char **outbuf)
 		buflen += strlen(*args) + 1;
 		*outbuf = realloc(*outbuf, buflen);
 		if (*outbuf == NULL)
-			err(1, "realloc");
+			err(1, "[%d] realloc", getpid());
 		if (*outbuf[0] != '\0')
 			strlcat(*outbuf, " ", buflen);
 		strlcat(*outbuf, *args, buflen);
 		args++;
 	}
 
-	DPRINTF(("PID %d: %s\n", pid, *outbuf));
+	DPRINTF(("[%d] PID %d: %s\n", getpid(), pid, *outbuf));
 
 	free(buf);
 	return 0;
 #else
-	warn("procname not implemented");
+	warn("[%d] procname not implemented", getpid());
 	return -1;
 #endif
 }
