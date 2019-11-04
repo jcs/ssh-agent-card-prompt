@@ -1,44 +1,41 @@
 # vim:ts=8
 
-CC	?= cc
-CFLAGS	?= -O2
-CFLAGS	+= -Wall -Wunused -Wmissing-prototypes -Wstrict-prototypes -Wunused \
-		-Wpointer-sign
-#CFLAGS	+= -g
+PREFIX?=	/usr/local
+X11BASE?=	/usr/X11R6
+SYSCONFDIR?=	/etc
 
-PREFIX	?= /usr/local
-BINDIR	?= $(PREFIX)/bin
-MANDIR	?= $(PREFIX)/man/man1
+PKGLIBS=	x11 xft
 
-INSTALL_PROGRAM ?= install -s
-INSTALL_DATA ?= install
+CC?=		cc
+CFLAGS+=	-O2 -Wall \
+		-Wunused -Wmissing-prototypes -Wstrict-prototypes \
+		-Wpointer-sign \
+		`pkg-config --cflags ${PKGLIBS}`
+LDFLAGS+=	`pkg-config --libs ${PKGLIBS}`
 
-X11BASE	?= /usr/X11R6
-INCLUDES?= -I$(X11BASE)/include -I$(X11BASE)/include/freetype2
-LDPATH	?= -L$(X11BASE)/lib
-LIBS	+= -lX11 -lXft
+# uncomment to enable debugging
+#CFLAGS+=	-g
 
-PROG	= ssh-agent-card-prompt
-OBJS	= ssh-agent-card-prompt.o
+BINDIR=		$(PREFIX)/bin
+MANDIR=		$(PREFIX)/man/man1
 
-all: $(PROG)
+SRC!=		ls *.c
+OBJ=            ${SRC:.c=.o}
 
-$(PROG): $(OBJS)
-	$(CC) $(OBJS) $(LDPATH) $(LIBS) -o $@
+BIN=		ssh-agent-card-prompt
+MAN=		ssh-agent-card-prompt.1
 
-$(OBJS): *.c
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+all: ${BIN}
 
-README.md: $(PROG).1
-	mandoc -T markdown $(PROG).1 > README.md
+ssh-agent-card-prompt: $(OBJ)
+	$(CC) -o $@ $(OBJ) $(LDFLAGS)
 
 install: all
-	mkdir -p $(DESTDIR)$(BINDIR)
-	$(INSTALL_PROGRAM) $(PROG) $(DESTDIR)$(BINDIR)
-	mkdir -p $(DESTDIR)$(MANDIR)
-	$(INSTALL_DATA) -m 644 ${PROG}.1 $(DESTDIR)$(MANDIR)/${PROG}.1
+	mkdir -p $(BINDIR) $(MANDIR)
+	install -s $(BIN) $(BINDIR)
+	install -m 644 $(MAN) $(MANDIR)
 
 clean:
-	rm -f $(PROG) $(OBJS)
+	rm -f $(BIN) $(OBJ)
 
 .PHONY: all install clean
