@@ -343,7 +343,7 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 	 * information, and then SSH makes a SSH_AGENTC_SIGN_REQUEST request
 	 * with that key.
 	 *
-	 * Watch for a SSH_AGENT_IDENTITIES_ANSWER message and parse out the
+	 * Watch for an SSH_AGENT_IDENTITIES_ANSWER message and parse out the
 	 * keys, making note of which key has a comment that looks like a pkcs
 	 * key, so when we see that key blob in SSH_AGENTC_SIGN_REQUEST, we
 	 * know it's for our key that needs a touch confirmation.
@@ -420,7 +420,8 @@ forward_agent_message(ssize_t len, void *buf, int destfd, pid_t clientpid)
 			DPRINTF(("[%d] key[%d] = %s\n", getpid(), x, kcomm));
 
 			/* match on pkcs11 or pkcs15 */
-			if (strstr(kcomm, "pkcs1")) {
+			if (strstr(kcomm, "pkcs1") != NULL ||
+			    strstr(kcomm, "PIV AUTH pubkey") != NULL) {
 				DPRINTF(("[%d] found pkcs1 key at %d\n",
 				    getpid(), x));
 				pkcs_key_len = kbloblen;
